@@ -1,61 +1,64 @@
 /**
  * Worker principal de mensajes WhatsApp.
- * Usa BullMQ Flows para orquestar sub-tasks:
- *   processIncomingMessage (parent)
- *     └── wa:llm-generate (child) ── espera resultado antes de responder
+ *
+ * ARQUITECTURA FLOW:
+ * Este worker recibe el job de la queue 'wa:process-message'.
+ * En lugar de usar FlowProducer (que crea un parent NUEVO en otra queue),
+ * llama directamente al agente Mastra para mantener la cadena simple.
+ *
+ * Para multi-step reasoning avanzado con FlowProducer, usar message.flow.worker.ts
+ * (ver docs). El Flow requiere que el parent job sea encolado POR el FlowProducer,
+ * no que un worker existente cree el Flow — ese era el bug original.
+ *
+ * FIX: importar sendTextMessage causaba inicializar el socket de Baileys
+ * en el proceso worker (proceso separado). Se usa Redis pub/sub para
+ * notificar al gateway que debe enviar el mensaje.
  */
 
-import { Worker, FlowProducer } from 'bullmq';
-import { connectionOptions } from '../config/redis.js';
-import { sendTextMessage } from '../gateway/baileys.js';
+import { Worker } from 'bullmq';
+import { connectionOptions, redisSubscriber } from '../config/redis.js';
+import { whatsappAgent } from '../mastra/agent.js';
 import pino from 'pino';
 import type { IncomingMessagePayload, MessageProcessResult } from '../tasks/index.js';
+import Redis from 'ioredis';
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
-const flowProducer = new FlowProducer(connectionOptions);
+
+// Publisher separado para notificar al gateway que envíe el mensaje
+const publisher = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', {
+  maxRetriesPerRequest: null,
+});
 
 logger.info('Starting message worker...');
 
 const messageWorker = new Worker<IncomingMessagePayload, MessageProcessResult>(
   'wa:process-message',
   async (job) => {
-    const { from, text, threadId, timestamp } = job.data;
-    logger.info({ from, threadId }, 'Processing incoming message');
+    const { from, text, threadId } = job.data;
+    logger.info({ from, threadId, jobId: job.id }, 'Processing incoming message');
 
-    // Crear flow: este job es el parent, llm-generate es el child
-    // El parent se completa SOLO cuando el child termina
-    const flow = await flowProducer.add({
-      name: 'process-message-flow',
-      queueName: 'wa:response-sender', // cola virtual de respuesta
-      data: { from, threadId },
-      children: [
-        {
-          name: 'llm-generate',
-          queueName: 'wa:llm-generate',
-          data: {
-            threadId,
-            userMessage: text,
-            resourceId: from,
-          },
-          opts: { attempts: 2 },
-        },
-      ],
+    // Llamar directamente al agente Mastra (que internamente usa memoria)
+    const response = await whatsappAgent.generate(text, {
+      resourceId: from,
+      threadId,
     });
 
-    // Esperar resultado del child con polling
-    const childValues = await flow.job.getChildrenValues();
-    const llmResult = Object.values(childValues)[0] as { text: string; tokensUsed?: number };
+    const reply = response.text;
+    logger.info({ from, replyLen: reply.length, jobId: job.id }, 'Reply generated');
 
-    if (!llmResult?.text) {
-      throw new Error('LLM child job did not return text');
-    }
+    // Publicar en canal Redis para que el gateway de Baileys envíe el mensaje
+    // El gateway suscribe a este canal y llama a sock.sendMessage()
+    await publisher.publish(
+      'wa:send-message',
+      JSON.stringify({ to: from, text: reply })
+    );
 
-    logger.info({ from, reply: llmResult.text.slice(0, 80) }, 'Sending reply');
-    await sendTextMessage(from, llmResult.text);
-
-    return { reply: llmResult.text, tokensUsed: llmResult.tokensUsed };
+    return { reply, tokensUsed: response.usage?.totalTokens };
   },
-  { ...connectionOptions, concurrency: 2 }
+  {
+    ...connectionOptions,
+    concurrency: 2,
+  }
 );
 
 messageWorker.on('completed', (job) => {
@@ -63,11 +66,18 @@ messageWorker.on('completed', (job) => {
 });
 
 messageWorker.on('failed', (job, err) => {
-  logger.error({ jobId: job?.id, err }, 'Message processing failed');
-  // En caso de fallo, intentar notificar al usuario
+  logger.error({ jobId: job?.id, err: err.message }, 'Message processing failed');
+  // Notificar al usuario del error vía el mismo canal Redis
   if (job?.data.from) {
-    sendTextMessage(job.data.from, '⚠️ Hubo un error procesando tu mensaje. Intentá de nuevo.').catch(() => {});
+    publisher.publish(
+      'wa:send-message',
+      JSON.stringify({ to: job.data.from, text: '⚠️ Hubo un error procesando tu mensaje. Intentá de nuevo.' })
+    ).catch(() => {});
   }
 });
 
-logger.info('Message worker ready');
+messageWorker.on('error', (err) => {
+  logger.error({ err: err.message }, 'Message worker error');
+});
+
+logger.info('Message worker ready — listening on queue: wa:process-message');

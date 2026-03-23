@@ -8,6 +8,11 @@
  * Una vez conectado y guardada la sesión en auth/,
  * las reconexiones son automáticas sin pedir QR de nuevo.
  *
+ * INTEGRACIÓN CON WORKERS:
+ * Los mensajes entrantes se encolan en BullMQ (processIncomingMessage.call()).
+ * Las respuestas generadas por los workers llegan por Redis pub/sub canal 'wa:send-message'.
+ * El gateway suscribe a ese canal y llama a sock.sendMessage().
+ *
  * NOTA v7: cuando v7.0.0 salga como stable, los cambios necesarios son:
  *   - fetchLatestBaileysVersion() → fetchWAWebVersion()
  *   - isJidUser() → isPnUser() / isLidUser()
@@ -28,6 +33,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
+import Redis from 'ioredis';
 import { processIncomingMessage } from '../tasks/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -39,6 +45,26 @@ let sock: WASocket | null = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT = 10;
 const MAX_RECONNECT_DELAY = 30_000;
+
+// Suscriptor Redis: recibe respuestas generadas por los workers
+const subscriber = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', {
+  maxRetriesPerRequest: null,
+});
+
+subscriber.subscribe('wa:send-message', (err) => {
+  if (err) logger.error({ err }, 'Error subscribing to wa:send-message');
+  else logger.info('Gateway suscrito a canal wa:send-message');
+});
+
+subscriber.on('message', async (channel, message) => {
+  if (channel !== 'wa:send-message') return;
+  try {
+    const { to, text } = JSON.parse(message) as { to: string; text: string };
+    await sendTextMessage(to, text);
+  } catch (err) {
+    logger.error({ err }, 'Error procesando mensaje de canal Redis');
+  }
+});
 
 // ─── Helpers CLI ──────────────────────────────────────────────────────────────
 
@@ -77,7 +103,6 @@ export async function connectToWhatsApp(
   method: 'qr' | 'pairing' | null = null,
   phoneNumber: string | null = null
 ): Promise<void> {
-  // Primera ejecución: preguntar método si no hay sesión guardada
   const hasSession = fs.existsSync(AUTH_DIR) && fs.readdirSync(AUTH_DIR).length > 0;
 
   if (!hasSession && !method) {
@@ -86,7 +111,7 @@ export async function connectToWhatsApp(
       phoneNumber = await getPhoneNumber();
     }
   } else if (!method) {
-    method = 'qr'; // sesión existente: reconectar silenciosamente
+    method = 'qr';
   }
 
   if (!fs.existsSync(AUTH_DIR)) {
@@ -123,7 +148,6 @@ export async function connectToWhatsApp(
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // ── QR ───────────────────────────────────────────────────────────────────
     if (method === 'qr' && qr && !qrShown) {
       qrShown = true;
       console.clear();
@@ -134,7 +158,6 @@ export async function connectToWhatsApp(
       console.log('\n⏳ Esperando escaneo...\n');
     }
 
-    // ── Pairing Code ─────────────────────────────────────────────────────────
     if (
       method === 'pairing' &&
       connection === 'connecting' &&
@@ -158,7 +181,6 @@ export async function connectToWhatsApp(
       }
     }
 
-    // ── Conexión exitosa ──────────────────────────────────────────────────────
     if (connection === 'open') {
       connected = true;
       reconnectAttempts = 0;
@@ -172,7 +194,6 @@ export async function connectToWhatsApp(
       logger.info('WhatsApp conectado. Escuchando mensajes...');
     }
 
-    // ── Conexión cerrada ──────────────────────────────────────────────────────
     if (connection === 'close') {
       if (connected) return;
 
@@ -187,18 +208,17 @@ export async function connectToWhatsApp(
       }
 
       if (reconnectAttempts >= MAX_RECONNECT) {
-        logger.error('Máximo de reintentos alcanzado. Esperá unos minutos.');
+        logger.error('Máximo de reintentos alcanzado.');
         process.exit(1);
       }
 
-      // Backoff exponencial con cap
       const delay = Math.min(1000 * 2 ** reconnectAttempts, MAX_RECONNECT_DELAY);
       logger.info({ delay }, 'Reconectando...');
       setTimeout(() => connectToWhatsApp(method, phoneNumber), delay);
     }
   });
 
-  // ── Mensajes entrantes → cola BullMQ ──────────────────────────────────────
+  // Mensajes entrantes → cola BullMQ
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
 
@@ -214,9 +234,8 @@ export async function connectToWhatsApp(
 
       if (!text.trim()) continue;
 
-      logger.info({ from, preview: text.slice(0, 60) }, 'Mensaje recibido');
+      logger.info({ from, preview: text.slice(0, 60) }, 'Mensaje recibido → encolando');
 
-      // Encolar como DurableTask — fire & forget
       await processIncomingMessage.call({
         from,
         text,
@@ -226,7 +245,6 @@ export async function connectToWhatsApp(
     }
   });
 
-  // Timeout de 5 minutos si nunca se conectó (setup inicial)
   if (!hasSession) {
     setTimeout(() => {
       if (!connected) {
@@ -237,14 +255,12 @@ export async function connectToWhatsApp(
   }
 }
 
-// Función para enviar respuesta (usada desde workers)
 export async function sendTextMessage(to: string, text: string): Promise<void> {
   if (!sock) throw new Error('Socket WhatsApp no inicializado');
   await sock.sendMessage(to, { text });
   logger.info({ to, len: text.length }, 'Mensaje enviado');
 }
 
-// Punto de entrada del proceso
 connectToWhatsApp().catch((err) => {
   logger.error({ err }, 'Error fatal en gateway Baileys');
   process.exit(1);
