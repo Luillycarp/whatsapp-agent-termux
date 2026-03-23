@@ -1,0 +1,36 @@
+{
+  "name": "whatsapp-agent-termux",
+  "version": "1.0.0",
+  "description": "WhatsApp AI Agent for Termux/Android — Baileys + BullMQ + Mastra",
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/gateway/baileys.ts",
+    "dev:mastra": "mastra dev --dir src/mastra",
+    "workers": "bun src/workers/message.worker.ts",
+    "dashboard": "bun src/dashboard/board.ts",
+    "start": "pm2 start ecosystem.config.js",
+    "stop": "pm2 stop all",
+    "logs": "pm2 logs",
+    "monit": "pm2 monit"
+  },
+  "dependencies": {
+    "@ai-sdk/groq": "^1.0.0",
+    "@bull-board/api": "^6.0.0",
+    "@bull-board/fastify": "^6.0.0",
+    "@mastra/core": "^0.7.0",
+    "@mastra/memory": "^0.7.0",
+    "@mastra/libsql": "^0.7.0",
+    "@whiskeysockets/baileys": "^6.7.0",
+    "bullmq": "^5.0.0",
+    "fastify": "^4.0.0",
+    "ioredis": "^5.0.0",
+    "pino": "^9.0.0",
+    "pino-pretty": "^13.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "mastra": "^0.7.0",
+    "typescript": "^5.5.0"
+  }
+}

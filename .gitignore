@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+auth_info/
+data/
+*.db
+*.db-shm
+*.db-wal
+.mastra/
+pm2.pid
+logs/
