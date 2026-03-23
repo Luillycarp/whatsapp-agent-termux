@@ -1,13 +1,25 @@
 /**
- * Gateway Baileys — Conexión WhatsApp con reconexión automática.
- * Optimizado para sobrevivir en Termux (Android mata procesos en background).
+ * Gateway Baileys v7.0.0-rc.9
+ * Reconexión automática con backoff exponencial — crítico en Termux.
+ *
+ * BREAKING CHANGES v7 aplicados:
+ * - fetchLatestBaileysVersion() reemplazado por fetchWAWebVersion()
+ * - JIDs de usuario ahora pueden ser LIDs (formato diferente a PNs)
+ * - isJidUser() reemplazado por isPnUser() para PNs
+ * - proto.fromObject() → proto.create(), proto.encode/decode
+ * - Migrar a LIDs en lugar de restaurar PN JIDs
+ *
+ * Refs: https://baileys.wiki/docs/migration/to-v7.0.0/
  */
 
 import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
-  fetchLatestBaileysVersion,
+  fetchWAWebVersion,
+  isPnUser,
+  isLidUser,
   type WASocket,
+  type BaileysEventMap,
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
@@ -21,24 +33,27 @@ const MAX_RECONNECT_DELAY = 30_000;
 
 export async function connectToWhatsApp(): Promise<void> {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info');
-  const { version } = await fetchLatestBaileysVersion();
 
-  logger.info({ version }, 'Connecting to WhatsApp...');
+  // v7: fetchWAWebVersion() reemplaza fetchLatestBaileysVersion()
+  const { version, isLatest } = await fetchWAWebVersion();
+  logger.info({ version, isLatest }, 'Connecting to WhatsApp...');
 
   sock = makeWASocket({
     version,
     auth: state,
-    printQRInTerminal: true, // Muestra QR en consola Termux
-    logger: pino({ level: 'silent' }), // Silenciar logs internos de Baileys
-    browser: ['WhatsApp Agent', 'Termux', '1.0.0'],
+    printQRInTerminal: true,
+    logger: pino({ level: 'silent' }),
+    // v7: usar 'Chrome' o 'Safari' — evita fingerprinting de automatización
+    browser: ['Chrome (Linux)', '', ''],
     markOnlineOnConnect: false, // Menos batería en mobile
     syncFullHistory: false,
+    // v7: habilitar soporte de LIDs (obligatorio en v7)
+    // Los LIDs son el nuevo sistema de identidad de WhatsApp
+    generateHighQualityLinkPreview: false,
   });
 
-  // Guardar credenciales cuando se actualicen
   sock.ev.on('creds.update', saveCreds);
 
-  // Manejo de conexión con reconexión automática
   sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
     if (qr) {
       logger.info('Scan el QR con WhatsApp en tu teléfono');
@@ -52,32 +67,35 @@ export async function connectToWhatsApp(): Promise<void> {
 
       if (shouldReconnect) {
         reconnectAttempts++;
-        // Backoff exponencial con cap de 30s — crítico en Termux
         const delay = Math.min(1000 * 2 ** reconnectAttempts, MAX_RECONNECT_DELAY);
         logger.info({ delay, attempt: reconnectAttempts }, 'Reconnecting...');
         setTimeout(() => connectToWhatsApp(), delay);
       } else {
-        logger.error('Logged out from WhatsApp. Delete auth_info/ and restart.');
+        logger.error('Logged out. Borrá auth_info/ y reiniciá.');
         process.exit(1);
       }
     }
 
     if (connection === 'open') {
       reconnectAttempts = 0;
-      logger.info('WhatsApp connected successfully');
+      logger.info('WhatsApp conectado correctamente');
     }
   });
 
-  // Procesar mensajes entrantes
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+  sock.ev.on('messages.upsert', async ({ messages, type }: BaileysEventMap['messages.upsert']) => {
     if (type !== 'notify') return;
 
     for (const msg of messages) {
-      // Ignorar mensajes propios y de estado
       if (msg.key.fromMe) continue;
       if (msg.key.remoteJid === 'status@broadcast') continue;
 
-      const from = msg.key.remoteJid!;
+      const jid = msg.key.remoteJid!;
+
+      // v7: los JIDs ahora pueden ser LIDs o PNs
+      // isPnUser() para números de teléfono tradicionales
+      // isLidUser() para los nuevos LIDs de Meta
+      if (!isPnUser(jid) && !isLidUser(jid)) continue;
+
       const text =
         msg.message?.conversation ||
         msg.message?.extendedTextMessage?.text ||
@@ -85,28 +103,25 @@ export async function connectToWhatsApp(): Promise<void> {
 
       if (!text.trim()) continue;
 
-      logger.info({ from, text: text.slice(0, 50) }, 'Message received');
+      logger.info({ jid, text: text.slice(0, 50) }, 'Message received');
 
-      // Encolar como DurableTask — fire & forget
       await processIncomingMessage.call({
-        from,
+        from: jid,
         text,
-        threadId: from, // JID = ID único de la conversación
+        threadId: jid,
         timestamp: Date.now(),
       });
     }
   });
 }
 
-// Función para enviar respuesta (usada desde workers)
 export async function sendTextMessage(to: string, text: string): Promise<void> {
-  if (!sock) throw new Error('WhatsApp socket not initialized');
+  if (!sock) throw new Error('WhatsApp socket no inicializado');
   await sock.sendMessage(to, { text });
-  logger.info({ to, textLen: text.length }, 'Message sent');
+  logger.info({ to, textLen: text.length }, 'Mensaje enviado');
 }
 
-// Punto de entrada
 connectToWhatsApp().catch((err) => {
-  logger.error({ err }, 'Fatal error in Baileys gateway');
+  logger.error({ err }, 'Error fatal en gateway Baileys');
   process.exit(1);
 });
