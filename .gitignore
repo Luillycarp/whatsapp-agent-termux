@@ -1,7 +1,7 @@
 node_modules/
 dist/
 .env
-auth_info/
+auth/
 data/
 *.db
 *.db-shm
@@ -9,3 +9,5 @@ data/
 .mastra/
 pm2.pid
 logs/
+# El estado del provider NO se ignora: persiste entre reinicios
+# provider.state.json  <- commitéalo si querés compartir config

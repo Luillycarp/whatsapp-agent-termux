@@ -5,19 +5,14 @@
  *   [1] QR Code        — escanear con WhatsApp
  *   [2] Pairing Code  — código de 8 dígitos
  *
- * Una vez conectado y guardada la sesión en auth/,
- * las reconexiones son automáticas sin pedir QR de nuevo.
+ * INTEGRACIÓN:
+ * - Mensajes entrantes → BullMQ (processIncomingMessage.call())
+ * - Comandos !provider → interceptados aquí antes de encolar
+ * - Respuestas de workers → llegan por Redis pub/sub 'wa:send-message'
  *
- * INTEGRACIÓN CON WORKERS:
- * Los mensajes entrantes se encolan en BullMQ (processIncomingMessage.call()).
- * Las respuestas generadas por los workers llegan por Redis pub/sub canal 'wa:send-message'.
- * El gateway suscribe a ese canal y llama a sock.sendMessage().
- *
- * NOTA v7: cuando v7.0.0 salga como stable, los cambios necesarios son:
- *   - fetchLatestBaileysVersion() → fetchWAWebVersion()
- *   - isJidUser() → isPnUser() / isLidUser()
- *   - proto.fromObject() → proto.create()
- *   Ref: https://baileys.wiki/docs/migration/to-v7.0.0/
+ * NOTA v7: fetchLatestBaileysVersion() → fetchWAWebVersion()
+ *          isJidUser() → isPnUser() / isLidUser()
+ *          Ref: https://baileys.wiki/docs/migration/to-v7.0.0/
  */
 
 import makeWASocket, {
@@ -35,6 +30,7 @@ import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import Redis from 'ioredis';
 import { processIncomingMessage } from '../tasks/index.js';
+import { handleCommand } from './commands.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const AUTH_DIR = path.join(__dirname, '../../auth');
@@ -107,16 +103,12 @@ export async function connectToWhatsApp(
 
   if (!hasSession && !method) {
     method = await chooseMethod();
-    if (method === 'pairing') {
-      phoneNumber = await getPhoneNumber();
-    }
+    if (method === 'pairing') phoneNumber = await getPhoneNumber();
   } else if (!method) {
     method = 'qr';
   }
 
-  if (!fs.existsSync(AUTH_DIR)) {
-    fs.mkdirSync(AUTH_DIR, { recursive: true });
-  }
+  if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
   if (!hasSession) {
     console.clear();
@@ -125,7 +117,6 @@ export async function connectToWhatsApp(
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version, isLatest } = await fetchLatestBaileysVersion();
-
   logger.info({ version: version.join('.'), isLatest }, 'Baileys version');
 
   sock = makeWASocket({
@@ -189,36 +180,30 @@ export async function connectToWhatsApp(
       console.log('║        ✅  CONECTADO EXITOSAMENTE        ║');
       console.log('╠══════════════════════════════════════════╣');
       console.log(`║  Sesión guardada en: auth/               ║`);
-      console.log('║  Workers procesando mensajes...          ║');
+      console.log('║  Escribí !provider help para comandos   ║');
       console.log('╚══════════════════════════════════════════╝\n');
       logger.info('WhatsApp conectado. Escuchando mensajes...');
     }
 
     if (connection === 'close') {
       if (connected) return;
-
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       reconnectAttempts++;
-
       logger.warn({ statusCode, attempt: reconnectAttempts }, 'Conexión cerrada');
-
       if (statusCode === DisconnectReason.loggedOut) {
-        logger.error('Sesión cerrada por WhatsApp. Borrá auth/ y reiniciá.');
+        logger.error('Sesión cerrada. Borrá auth/ y reiniciá.');
         process.exit(1);
       }
-
       if (reconnectAttempts >= MAX_RECONNECT) {
         logger.error('Máximo de reintentos alcanzado.');
         process.exit(1);
       }
-
       const delay = Math.min(1000 * 2 ** reconnectAttempts, MAX_RECONNECT_DELAY);
-      logger.info({ delay }, 'Reconectando...');
       setTimeout(() => connectToWhatsApp(method, phoneNumber), delay);
     }
   });
 
-  // Mensajes entrantes → cola BullMQ
+  // ── Mensajes entrantes ────────────────────────────────────────────────────
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
 
@@ -234,8 +219,15 @@ export async function connectToWhatsApp(
 
       if (!text.trim()) continue;
 
-      logger.info({ from, preview: text.slice(0, 60) }, 'Mensaje recibido → encolando');
+      // ── Interceptar comandos !provider ────────────────────────────────────
+      const commandResponse = handleCommand(text);
+      if (commandResponse !== null) {
+        await sendTextMessage(from, commandResponse);
+        continue; // NO encolar en BullMQ
+      }
 
+      // ── Mensaje normal → encolar en BullMQ ──────────────────────────────
+      logger.info({ from, preview: text.slice(0, 60) }, 'Mensaje recibido → encolando');
       await processIncomingMessage.call({
         from,
         text,
@@ -247,10 +239,7 @@ export async function connectToWhatsApp(
 
   if (!hasSession) {
     setTimeout(() => {
-      if (!connected) {
-        logger.warn('Timeout de 5 minutos sin conexión. Reintentando...');
-        connectToWhatsApp(method, phoneNumber);
-      }
+      if (!connected) connectToWhatsApp(method, phoneNumber);
     }, 300_000);
   }
 }
